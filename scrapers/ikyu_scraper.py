@@ -1,56 +1,126 @@
 import asyncio
 import re
 from datetime import date, timedelta
+from pathlib import Path
 from playwright.async_api import async_playwright
 
+DEBUG_DIR = Path(__file__).parent.parent / "data" / "debug"
+
 HOTEL_ID = "00002470"
-TARGET_PLAN_KEYWORDS = ["亀の井別荘の洋室", "季節の会席"]
-TARGET_ROOM_KEYWORDS = ["園林", "本館洋室ツイン"]
+
+LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+]
 
 
-async def _extract_prices_from_page(page, year: int, month: int) -> dict[str, int]:
-    prices = {}
-    content = await page.content()
-
-    # Pattern 1: JSON embedded data
-    json_matches = re.findall(
-        r'"date"\s*:\s*"(\d{4}-\d{2}-\d{2})"[^}]{0,200}?"price"\s*:\s*(\d+)', content
-    )
-    for d, p in json_matches:
-        prices[d] = int(p)
-
-    if prices:
-        return prices
-
-    # Pattern 2: data attributes on calendar cells
-    cells = await page.query_selector_all("[data-date], [data-ymd]")
-    for cell in cells:
-        raw = await cell.get_attribute("data-date") or await cell.get_attribute("data-ymd")
-        if not raw:
-            continue
-        text = await cell.inner_text()
-        price_match = re.search(r"([0-9,]+)", text)
-        if price_match:
-            prices[raw[:10]] = int(price_match.group(1).replace(",", ""))
-
-    if prices:
-        return prices
-
-    # Pattern 3: parse visible price cells from calendar grid
-    price_els = await page.query_selector_all(
-        "[class*='calendar'] td, [class*='Calendar'] td"
-    )
-    for el in price_els:
-        text = await el.inner_text()
-        date_match = re.search(r"\b(\d{1,2})\b", text)
-        price_match = re.search(r"([0-9,]+)円", text)
-        if date_match and price_match:
-            day = int(date_match.group(1))
+def _extract_prices_from_json(obj, prices: dict, year: int, month: int):
+    if isinstance(obj, dict):
+        stay = (
+            obj.get("date") or obj.get("checkin") or obj.get("checkInDate")
+            or obj.get("stayDate") or obj.get("ymd")
+        )
+        price = (
+            obj.get("price") or obj.get("minPrice") or obj.get("lowestPrice")
+            or obj.get("amount") or obj.get("planPrice")
+        )
+        if stay and price:
+            raw = str(stay).replace("/", "-")[:10]
             try:
-                d = date(year, month, day).isoformat()
-                prices[d] = int(price_match.group(1).replace(",", ""))
-            except ValueError:
+                d = date.fromisoformat(raw)
+                if d.year == year and d.month == month:
+                    prices[raw] = int(str(price).replace(",", ""))
+            except (ValueError, TypeError):
                 pass
+        for v in obj.values():
+            _extract_prices_from_json(v, prices, year, month)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_prices_from_json(item, prices, year, month)
+
+
+async def _scrape_month(page, year: int, month: int) -> dict[str, int]:
+    prices: dict[str, int] = {}
+    intercepted: list = []
+
+    async def handle_response(resp):
+        ct = resp.headers.get("content-type", "")
+        if "json" in ct:
+            try:
+                body = await resp.json()
+                intercepted.append(body)
+            except Exception:
+                pass
+
+    page.on("response", handle_response)
+
+    url = (
+        f"https://www.ikyu.com/{HOTEL_ID}/"
+        f"?adc=1&discsort=1&lc=1&ppc=2&rc=1&si=1"
+        f"&st={year}{month:02d}01&top=plans"
+    )
+    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    await page.wait_for_timeout(5000)
+
+    page.remove_listener("response", handle_response)
+
+    # ① ネットワーク傍受
+    for body in intercepted:
+        _extract_prices_from_json(body, prices, year, month)
+    if prices:
+        return prices
+
+    # ② HTML内の正規表現
+    content = await page.content()
+    for pattern in [
+        r'"date"\s*:\s*"(\d{4}-\d{2}-\d{2})"[^}]{0,300}"price"\s*:\s*(\d+)',
+        r'"checkin"\s*:\s*"(\d{4}-\d{2}-\d{2})"[^}]{0,300}"price"\s*:\s*(\d+)',
+        r'"ymd"\s*:\s*"(\d{4}-\d{2}-\d{2})"[^}]{0,300}"price"\s*:\s*(\d+)',
+        r'(\d{4}-\d{2}-\d{2})[^0-9]{1,30}([1-9][0-9]{4,6})',
+    ]:
+        for m in re.finditer(pattern, content):
+            raw = m.group(1)
+            try:
+                d = date.fromisoformat(raw)
+                if d.year == year and d.month == month:
+                    prices[raw] = int(m.group(2).replace(",", ""))
+            except (ValueError, IndexError):
+                pass
+        if prices:
+            return prices
+
+    # ③ DOMセレクタ（6種類）
+    for sel in [
+        "[data-date]", "[data-ymd]", "[data-checkin]",
+        "[class*='calendar'] td", "[class*='Calendar'] td", "[class*='price']",
+    ]:
+        cells = await page.query_selector_all(sel)
+        for cell in cells:
+            raw_date = (
+                await cell.get_attribute("data-date")
+                or await cell.get_attribute("data-ymd")
+                or await cell.get_attribute("data-checkin")
+            )
+            text = await cell.inner_text()
+            price_m = re.search(r"([1-9][0-9,]{4,})", text)
+            if raw_date and price_m:
+                key = raw_date[:10].replace("/", "-")
+                try:
+                    d = date.fromisoformat(key)
+                    if d.year == year and d.month == month:
+                        prices[key] = int(price_m.group(1).replace(",", ""))
+                except ValueError:
+                    pass
+        if prices:
+            return prices
+
+    # デバッグHTML保存
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    debug_file = DEBUG_DIR / f"ikyu_{year}{month:02d}.html"
+    debug_file.write_text(content, encoding="utf-8")
+    print(f"  [debug] No prices found, saved HTML → {debug_file}")
 
     return prices
 
@@ -61,48 +131,33 @@ async def scrape_ikyu_kamenoi() -> dict[str, int | None]:
     all_prices: dict[str, int | None] = {}
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=LAUNCH_ARGS)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1280, "height": 900},
+            locale="ja-JP",
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
         )
         page = await context.new_page()
 
-        base_url = f"https://www.ikyu.com/{HOTEL_ID}/"
-
         for offset in range(7):
             first = (today.replace(day=1) + timedelta(days=32 * offset)).replace(day=1)
-            url = (
-                f"{base_url}?adc=1&discsort=1&lc=1&ppc=2&rc=1&si=1"
-                f"&st={first.strftime('%Y%m%d')}&top=plans"
-            )
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(3000)
-
-            # Try to find target plan and click calendar view
-            plan_links = await page.query_selector_all("a, button")
-            for link in plan_links:
-                text = await link.inner_text()
-                if any(kw in text for kw in TARGET_PLAN_KEYWORDS):
-                    try:
-                        await link.click(timeout=3000)
-                        await page.wait_for_timeout(2000)
-                    except Exception:
-                        pass
-                    break
-
-            monthly = await _extract_prices_from_page(page, first.year, first.month)
+            print(f"  [ikyu] {first.year}/{first.month:02d} 取得中...")
+            monthly = await _scrape_month(page, first.year, first.month)
+            print(f"  [ikyu] {first.year}/{first.month:02d} → {len(monthly)} 件")
             all_prices.update(monthly)
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
 
         await browser.close()
 
     return {
-        d: p
-        for d, p in all_prices.items()
+        d: v
+        for d, v in all_prices.items()
         if today.isoformat() <= d <= end_date.isoformat()
     }
